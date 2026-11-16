@@ -1,0 +1,98 @@
+rules_version = '2';
+
+// Tally has no login. Possession of a group link is the credential: anyone who
+// knows a group id or invite code can read and write that group's records.
+// These rules cannot tell members apart; they only whitelist fields, types,
+// sizes and amount bounds, forbid deletes, and keep money fields immutable.
+// The app re-checks identity (hashed member tokens) and money invariants.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function str(v, max) { return v is string && v.size() >= 1 && v.size() <= max; }
+    function paise(v) { return v is int && v >= 1 && v <= 10000000; }
+    function paiseOrZero(v) { return v is int && v >= 0 && v <= 10000000; }
+    function id(v) { return v is string && v.matches('^[A-Za-z0-9_-]{8,64}$'); }
+    function time(v) { return v is int && v > 0; }
+    function onlyKeys(keys) { return request.resource.data.keys().hasOnly(keys); }
+    function unchanged(keys) { return !request.resource.data.diff(resource.data).affectedKeys().hasAny(keys); }
+
+    function validMember(m) {
+      return m.keys().hasOnly(['id', 'name', 'upiId', 'tokenHash', 'devices', 'removed', 'joinedAt'])
+        && id(m.id) && str(m.name, 30)
+        && m.upiId.matches('^[a-zA-Z0-9.\\-_]{2,256}@[a-zA-Z]{2,64}$')
+        && m.tokenHash.matches('^[0-9a-f]{64}$')
+        && m.devices is list && m.devices.size() <= 10
+        && m.removed is bool;
+    }
+
+    function validGroup() {
+      let g = request.resource.data;
+      return onlyKeys(['id', 'name', 'inviteCode', 'createdAt', 'demo', 'creatorId', 'members'])
+        && id(g.id) && str(g.name, 40)
+        && g.inviteCode.matches('^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}$')
+        && time(g.createdAt) && g.demo is bool && id(g.creatorId)
+        && g.members is list && g.members.size() >= 1 && g.members.size() <= 20
+        // spot-check the first and last member (rules cannot loop)
+        && validMember(g.members[0]) && validMember(g.members[g.members.size() - 1]);
+    }
+
+    match /groups/{groupId} {
+      allow get: if true;
+      allow list: if request.query.limit <= 1; // invite code lookup only
+      allow create: if validGroup() && request.resource.data.id == groupId;
+      allow update: if validGroup() && unchanged(['id', 'createdAt', 'creatorId', 'demo']);
+      allow delete: if false;
+    }
+
+    match /expenses/{expenseId} {
+      allow read: if true;
+      allow create: if onlyKeys(['id', 'groupId', 'title', 'category', 'total', 'paidBy', 'mode',
+                                 'participants', 'splits', 'own', 'source', 'createdBy', 'createdAt', 'deleted'])
+        && request.resource.data.id == expenseId && id(request.resource.data.groupId)
+        && str(request.resource.data.title, 40)
+        && request.resource.data.category in ['food', 'travel', 'stay', 'fuel', 'fun', 'shopping', 'other']
+        && paise(request.resource.data.total)
+        && request.resource.data.mode in ['equal', 'my_part', 'full', 'custom', 'treat']
+        && request.resource.data.participants is list && request.resource.data.participants.size() <= 20
+        && request.resource.data.splits is map && request.resource.data.splits.size() <= 20
+        && request.resource.data.source in ['form', 'ai']
+        && id(request.resource.data.paidBy) && id(request.resource.data.createdBy)
+        && time(request.resource.data.createdAt) && request.resource.data.deleted == false
+        && (!('own' in request.resource.data) || paiseOrZero(request.resource.data.own));
+      // Only a soft delete is allowed. Money fields never change.
+      allow update: if request.resource.data.diff(resource.data).affectedKeys().hasOnly(['deleted', 'deletedBy', 'deletedAt'])
+        && request.resource.data.deleted == true && id(request.resource.data.deletedBy);
+      allow delete: if false;
+    }
+
+    match /payments/{paymentId} {
+      allow read: if true;
+      allow create: if onlyKeys(['id', 'groupId', 'from', 'to', 'amount', 'status', 'claimId', 'createdBy', 'createdAt'])
+        && request.resource.data.id == paymentId && id(request.resource.data.groupId)
+        && id(request.resource.data.from) && id(request.resource.data.to)
+        && request.resource.data.from != request.resource.data.to
+        && request.resource.data.createdBy == request.resource.data.from
+        && paise(request.resource.data.amount) && request.resource.data.status == 'paid'
+        && time(request.resource.data.createdAt);
+      // Status moves only: paid -> confirmed | disputed | undone. Amount never changes.
+      allow update: if request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'respondedAt'])
+        && resource.data.status == 'paid'
+        && request.resource.data.status in ['confirmed', 'disputed', 'undone'];
+      allow delete: if false;
+    }
+
+    match /claims/{claimId} {
+      allow read: if true;
+      allow create: if onlyKeys(['id', 'groupId', 'from', 'to', 'amount', 'status', 'createdBy', 'createdAt', 'lastSentAt'])
+        && request.resource.data.id == claimId && id(request.resource.data.groupId)
+        && id(request.resource.data.from) && id(request.resource.data.to)
+        && request.resource.data.createdBy == request.resource.data.to
+        && paise(request.resource.data.amount) && request.resource.data.status == 'requested';
+      allow update: if request.resource.data.diff(resource.data).affectedKeys().hasOnly(['amount', 'status', 'lastSentAt'])
+        && paise(request.resource.data.amount)
+        && request.resource.data.status in ['requested', 'awaiting', 'closed'];
+      allow delete: if false;
+    }
+  }
+}
